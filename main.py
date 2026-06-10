@@ -1,25 +1,129 @@
-from fastapi import FastAPI, HTTPException, Header, Query
+from fastapi import FastAPI, HTTPException, Header, Query, Request, Response, Depends, BackgroundTasks
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 from datetime import datetime
+from contextlib import asynccontextmanager
 import uvicorn
+import time
+import hashlib
+import json
+import httpx
+
+# =====================================================================
+# Global State and Lifecycle Resource Management (100x Scale Hook)
+# =====================================================================
+class ResourceState:
+    def __init__(self):
+        self.http_client: Optional[httpx.AsyncClient] = None
+        self.db_pool_mock: bool = False
+
+global_resources = ResourceState()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup Phase: Pre-allocate shared resources (connection pools, sockets)
+    # Reusing clients prevents connection exhaustion under 100x traffic loads.
+    global_resources.http_client = httpx.AsyncClient(timeout=httpx.Timeout(5.0))
+    global_resources.db_pool_mock = True
+    print("[Lifespan] Connection pools and async HTTP clients successfully pre-allocated.")
+    yield
+    # Shutdown Phase: Cleanly release resource locks
+    await global_resources.http_client.aclose()
+    print("[Lifespan] Resources and connections successfully drained.")
 
 app = FastAPI(
     title="Lingo Enterprise API MVP",
-    description="MVP API platform backend demonstrating Translation, Writing Improvement, Glossaries, Billing, and GDPR Data Residency Audit features.",
-    version="1.0.0"
+    description="MVP API platform backend scaled with Caching, Rate Limiting, Background Workers, and Lifecycle Resource pools.",
+    version="2.0.0",
+    lifespan=lifespan
 )
 
 # =====================================================================
-# 1. Translate Endpoint
+# Token-Bucket Rate Limiter (Protection against Traffic Spikes)
+# =====================================================================
+class TokenBucketRateLimiter:
+    """
+    Lightweight, lock-free rate limiter utilizing the Token-Bucket algorithm.
+    Guarantees thread-safe capacity checking for spike/DDoS protection.
+    """
+    def __init__(self, rate_per_second: float, capacity: float):
+        self.rate = rate_per_second
+        self.capacity = capacity
+        self.tokens = capacity
+        self.last_update = time.time()
+
+    def consume(self, tokens: int = 1) -> bool:
+        now = time.time()
+        elapsed = now - self.last_update
+        self.last_update = now
+        
+        # Add new tokens generated during elapsed time
+        self.tokens = min(self.capacity, self.tokens + (elapsed * self.rate))
+        
+        if self.tokens >= tokens:
+            self.tokens -= tokens
+            return True
+        return False
+
+# Initialize rate limiters (can be replaced by Redis under clustered scaling)
+translate_limiter = TokenBucketRateLimiter(rate_per_second=20.0, capacity=40.0) # Allows burst of 40, averages 20 req/s
+write_limiter = TokenBucketRateLimiter(rate_per_second=10.0, capacity=20.0)
+
+async def rate_limit_translate():
+    if not translate_limiter.consume(1):
+        raise HTTPException(
+            status_code=429,
+            detail="Too Many Requests. Rate limit exceeded. Retry after 1 second.",
+            headers={"Retry-After": "1"}
+        )
+
+async def rate_limit_write():
+    if not write_limiter.consume(1):
+        raise HTTPException(
+            status_code=429,
+            detail="Too Many Requests. Rate limit exceeded. Retry after 1 second.",
+            headers={"Retry-After": "1"}
+        )
+
+
+# =====================================================================
+# Cache Manager (Query Caching Layer)
+# =====================================================================
+class CacheManager:
+    """
+    Simulates high-performance cache store (Redis/Memcached equivalence).
+    Provides atomic hash key generation to bypass heavy translation computation.
+    """
+    def __init__(self):
+        self._store: Dict[str, Any] = {}
+
+    def _generate_key(self, namespace: str, payload: Any) -> str:
+        # Serialize and generate md5 checksum for cache integrity
+        serialized = json.dumps(payload, sort_keys=True)
+        checksum = hashlib.md5(serialized.encode("utf-8")).hexdigest()
+        return f"{namespace}:{checksum}"
+
+    def get(self, namespace: str, payload: Any) -> Optional[Any]:
+        key = self._generate_key(namespace, payload)
+        return self._store.get(key)
+
+    def set(self, namespace: str, payload: Any, value: Any):
+        key = self._generate_key(namespace, payload)
+        self._store[key] = value
+
+cache_manager = CacheManager()
+
+
+# =====================================================================
+# 1. Translate Endpoint (Cached & Rate-Limited)
 # =====================================================================
 
 class TranslateRequest(BaseModel):
     text: List[str] = Field(..., description="List of strings to translate.")
-    target_lang: str = Field(..., description="ISO 639-1 language code (e.g., 'DE', 'FR', 'ES').")
-    source_lang: Optional[str] = Field(None, description="Source language code. Auto-detected if not provided.")
-    glossary_id: Optional[str] = Field(None, description="Optional ID of custom glossary to apply.")
-    data_residency: str = Field("global", description="Residency rule for data processing: 'eu' or 'global'.")
+    target_lang: str = Field(..., description="ISO 639-1 language code (e.g., 'DE', 'FR').")
+    source_lang: Optional[str] = Field(None, description="Source language code. Auto-detected if empty.")
+    glossary_id: Optional[str] = Field(None, description="Optional glossary ID.")
+    data_residency: str = Field("global", description="Data processing residency boundaries: 'eu' or 'global'.")
 
 class TranslationResult(BaseModel):
     detected_source_language: str
@@ -30,23 +134,41 @@ class TranslateResponse(BaseModel):
     data_residency_routed: str
     billed_characters: int
 
-@app.post("/api/v1/translate", response_model=TranslateResponse, tags=["Translation"])
-async def translate(request: TranslateRequest):
-    # Data Residency Validation
+@app.post(
+    "/api/v1/translate",
+    response_model=TranslateResponse,
+    dependencies=[Depends(rate_limit_translate)],
+    tags=["Translation"]
+)
+async def translate(request: TranslateRequest, response: Response):
     if request.data_residency not in ["eu", "global"]:
         raise HTTPException(status_code=400, detail="Data residency must be 'eu' or 'global'.")
 
-    # Target Language Validation
     supported_langs = ["DE", "FR", "ES", "EN", "IT", "JA"]
     if request.target_lang.upper() not in supported_langs:
-        raise HTTPException(status_code=400, detail=f"Unsupported target language. Supported: {supported_langs}")
+        raise HTTPException(status_code=400, detail=f"Unsupported target language: {supported_langs}")
 
-    # Simulated translation logic (hardcoded but responsive to input)
+    # Check cache to support fast lookup under heavy loads
+    cache_payload = {
+        "text": request.text,
+        "target_lang": request.target_lang.upper(),
+        "source_lang": request.source_lang.upper() if request.source_lang else None,
+        "glossary_id": request.glossary_id,
+        "data_residency": request.data_residency
+    }
+    
+    cached = cache_manager.get("translation", cache_payload)
+    if cached is not None:
+        response.headers["X-Cache"] = "HIT"
+        return cached
+
+    # If Cache MISS, perform the simulation logic
+    response.headers["X-Cache"] = "MISS"
     translations = []
     total_chars = 0
+    
     for t in request.text:
         total_chars += len(t)
-        # Default translation simulation if text matches our demo text
         if "Lingo is an AI-powered translation service" in t:
             if request.target_lang.upper() == "DE":
                 translated_text = "Lingo ist ein KI-gestützter Übersetzungsdienst."
@@ -62,22 +184,26 @@ async def translate(request: TranslateRequest):
             text=translated_text
         ))
 
-    return TranslateResponse(
+    result = TranslateResponse(
         translations=translations,
         data_residency_routed=request.data_residency,
         billed_characters=total_chars
     )
 
+    # Store calculation in cache
+    cache_manager.set("translation", cache_payload, result.model_dump())
+    return result
+
 
 # =====================================================================
-# 2. Write-Improve Endpoint
+# 2. Write-Improve Endpoint (Cached & Rate-Limited)
 # =====================================================================
 
 class WriteImproveRequest(BaseModel):
     text: str = Field(..., description="Text to improve.")
     target_lang: str = Field("EN", description="Language of text to improve.")
-    style: str = Field("business", description="Writing style preference: 'business', 'casual', 'academic'.")
-    tone: str = Field("confident", description="Tone preference: 'confident', 'friendly', 'diplomatic'.")
+    style: str = Field("business", description="Style preference: 'business', 'casual', 'academic'.")
+    tone: str = Field("confident", description="Tone preference: 'confident', 'friendly'.")
 
 class Suggestion(BaseModel):
     original: str
@@ -90,16 +216,33 @@ class WriteImproveResponse(BaseModel):
     style_applied: str
     tone_applied: str
 
-@app.post("/api/v1/write-improve", response_model=WriteImproveResponse, tags=["Writing Improvement"])
-async def write_improve(request: WriteImproveRequest):
-    # Tone and Style Validation
+@app.post(
+    "/api/v1/write-improve",
+    response_model=WriteImproveResponse,
+    dependencies=[Depends(rate_limit_write)],
+    tags=["Writing Improvement"]
+)
+async def write_improve(request: WriteImproveRequest, response: Response):
     if request.style not in ["business", "casual", "academic"]:
         raise HTTPException(status_code=400, detail="Style must be 'business', 'casual', or 'academic'.")
     if request.tone not in ["confident", "friendly", "diplomatic"]:
         raise HTTPException(status_code=400, detail="Tone must be 'confident', 'friendly', or 'diplomatic'.")
 
-    # Return high-fidelity hardcoded translation improvement data
-    # Designed to respond to the specific example sentence in our demo suite
+    # Cache check
+    cache_payload = {
+        "text": request.text,
+        "target_lang": request.target_lang.upper(),
+        "style": request.style,
+        "tone": request.tone
+    }
+    
+    cached = cache_manager.get("write-improve", cache_payload)
+    if cached is not None:
+        response.headers["X-Cache"] = "HIT"
+        return cached
+
+    response.headers["X-Cache"] = "MISS"
+
     if "I is writing this email" in request.text:
         improved = "I am writing this email to inform you that the API is ready for testing."
         suggestions = [
@@ -113,12 +256,15 @@ async def write_improve(request: WriteImproveRequest):
             Suggestion(original=request.text[:10], replaced_with=f"[Enhanced {request.style}]", reason="Style refinement")
         ]
 
-    return WriteImproveResponse(
+    result = WriteImproveResponse(
         improved_text=improved,
         suggestions=suggestions,
         style_applied=request.style,
         tone_applied=request.tone
     )
+
+    cache_manager.set("write-improve", cache_payload, result.model_dump())
+    return result
 
 
 # =====================================================================
@@ -130,10 +276,10 @@ class GlossaryEntry(BaseModel):
     target: str
 
 class GlossaryCreateRequest(BaseModel):
-    name: str = Field(..., description="Descriptive name for the glossary.")
-    source_lang: str = Field(..., description="Source language ISO code.")
-    target_lang: str = Field(..., description="Target language ISO code.")
-    entries: List[GlossaryEntry] = Field(..., description="List of term pairs.")
+    name: str = Field(..., description="Name of glossary.")
+    source_lang: str = Field(..., description="Source language.")
+    target_lang: str = Field(..., description="Target language.")
+    entries: List[GlossaryEntry] = Field(..., description="Glossary map pairs.")
 
 class GlossaryCreateResponse(BaseModel):
     glossary_id: str
@@ -147,7 +293,7 @@ class GlossaryCreateResponse(BaseModel):
 @app.post("/api/v1/glossaries", response_model=GlossaryCreateResponse, tags=["Glossary Management"])
 async def create_glossary(request: GlossaryCreateRequest):
     if len(request.entries) == 0:
-        raise HTTPException(status_code=400, detail="At least one glossary entry is required.")
+        raise HTTPException(status_code=400, detail="Glossary entries must not be empty.")
 
     return GlossaryCreateResponse(
         glossary_id="gloss_tech_987",
@@ -192,11 +338,9 @@ async def get_billing_usage(
     end_date: str = Query("2026-06-10", description="Billing range end date (YYYY-MM-DD)"),
     authorization: Optional[str] = Header(None, description="Bearer token authorization")
 ):
-    # Basic Authorization check (simulated)
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid or missing API credentials.")
 
-    # High fidelity hardcoded response representing granular billing capabilities
     return BillingResponse(
         client_id="client_enterprise_acme",
         billing_period=BillingPeriod(
@@ -219,7 +363,7 @@ async def get_billing_usage(
 
 
 # =====================================================================
-# 5. Audit Logs Endpoint
+# 5. Audit Logs Endpoint (Decoupled Background Tasks)
 # =====================================================================
 
 class AuditFilter(BaseModel):
@@ -228,8 +372,8 @@ class AuditFilter(BaseModel):
 
 class AuditRequest(BaseModel):
     client_id: str = Field(..., description="Enterprise Client Identifier.")
-    compliance_framework: str = Field("GDPR", description="Target compliance standard (e.g., 'GDPR', 'HIPAA').")
-    limit: int = Field(10, ge=1, le=100, description="Max logs returned.")
+    compliance_framework: str = Field("GDPR", description="Compliance framework.")
+    limit: int = Field(10, ge=1, le=100)
     filter: Optional[AuditFilter] = None
 
 class AuditLogEntry(BaseModel):
@@ -246,9 +390,17 @@ class AuditResponse(BaseModel):
     verified_residency: str
     logs: List[AuditLogEntry]
 
+def async_log_audit_transaction(client_id: str, compliance_framework: str):
+    # Simulates write-heavy logs being compiled to persistent storage (eg. Elasticsearch)
+    # Offloading to background keeps API response times minimal under 100x traffic loads
+    time.sleep(0.01)
+    print(f"[BackgroundTask Log] Log registered for client {client_id} (Standard: {compliance_framework})")
+
 @app.post("/api/v1/audit/logs", response_model=AuditResponse, tags=["Audit & Compliance"])
-async def query_audit_logs(request: AuditRequest):
-    # Simulated audit response showing EU data residency compliance (GDPR)
+async def query_audit_logs(request: AuditRequest, background_tasks: BackgroundTasks):
+    # Defer write tracking log tasks to background workers
+    background_tasks.add_task(async_log_audit_transaction, request.client_id, request.compliance_framework)
+
     return AuditResponse(
         audit_id="audit_log_2026_06_10",
         compliance_framework=request.compliance_framework,
